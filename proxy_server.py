@@ -67,6 +67,7 @@ ENDPOINTS:
 from flask import Flask, jsonify, request
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from requests.adapters import HTTPAdapter
 import numpy as np
 import requests
 import io
@@ -74,6 +75,15 @@ import math
 import colorsys
 
 app = Flask(__name__)
+
+# One shared Session = TLS connection reuse. Without this, EVERY tile/color/
+# Overpass fetch performed a full fresh TLS handshake — dozens per batch
+# request — and on Render's free-tier CPU (0.1 vCPU) handshake crypto alone
+# blew past gunicorn's request timeout under load (measured live: 16-tile
+# batches dying at exactly the ~30s worker timeout). With pooling, each
+# worker pays the handshake once per host and reuses the connection.
+_http = requests.Session()
+_http.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=32))
 
 TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 # Esri World Imagery — real satellite/aerial photography, free, no API key.
@@ -213,7 +223,7 @@ OVERPASS_TIMEOUT_SECONDS = 15
 
 
 def _fetch_overpass_one(mirror_url, query):
-    resp = requests.post(mirror_url, data={"data": query}, timeout=OVERPASS_TIMEOUT_SECONDS, headers=OVERPASS_HEADERS)
+    resp = _http.post(mirror_url, data={"data": query}, timeout=OVERPASS_TIMEOUT_SECONDS, headers=OVERPASS_HEADERS)
     resp.raise_for_status()
     return resp.json()
 
@@ -385,12 +395,31 @@ def features():
     return jsonify(payload)
 
 
+# Raw satellite tile bytes, keyed (z,x,y) — ~15KB each, so this is cheap
+# memory even at 200 entries. Cached for the same reason _elev_cache is:
+# batch prefetching should never fetch the same tile twice.
+_color_cache = {}
+COLOR_CACHE_MAX = 200
+
+
 def _fetch_color_tile(z, x, y):
+    """Satellite tile PNG bytes, cached; None on any failure (terrain then
+    falls back to elevation-based coloring for that tile)."""
+    key = (z, x, y)
+    if key in _color_cache:
+        return _color_cache[key]
     try:
-        return requests.get(
+        resp = _http.get(
             COLOR_TILE_URL.format(z=z, x=x, y=y), timeout=10, headers=COLOR_TILE_HEADERS)
     except requests.RequestException:
         return None
+    if resp.status_code != 200:
+        return None
+    data = resp.content
+    if len(_color_cache) > COLOR_CACHE_MAX:
+        _color_cache.clear()
+    _color_cache[key] = data
+    return data
 
 
 # Decoded 256x256 elevation arrays (float32 meters), keyed (z,x,y). Exists
@@ -417,7 +446,7 @@ def _get_elevation_array(z, x, y):
     if key in _elev_cache:
         return _elev_cache[key]
     try:
-        resp = requests.get(TILE_URL.format(z=z, x=x, y=y), timeout=15)
+        resp = _http.get(TILE_URL.format(z=z, x=x, y=y), timeout=15)
     except requests.RequestException:
         return None
     if resp.status_code != 200:
@@ -460,7 +489,7 @@ def build_tile_payload(z, x, y, grid):
         east = east_f.result()
         south = south_f.result()
         diag = diag_f.result()
-        color_resp = color_f.result()
+        color_bytes = color_f.result()
 
     if main is None:
         return None
@@ -485,8 +514,8 @@ def build_tile_payload(z, x, y, grid):
     small = full[np.ix_(idx, idx)]
 
     colors = None
-    if color_resp is not None and color_resp.status_code == 200:
-        raw = sample_map_tile_raw(color_resp.content, grid)
+    if color_bytes is not None:
+        raw = sample_map_tile_raw(color_bytes, grid)
         colors = [[boosted_hex(px) for px in row] for row in raw]
 
     payload = {
@@ -538,18 +567,39 @@ def elevation_batch():
         return jsonify({"error": "tiles=z/x/y,z/x/y,... required"}), 400
     specs = specs[:MAX_BATCH_TILES]
 
+    # PREFETCH, deduplicated across the whole batch: adjacent tiles share
+    # most of their stitch-neighbors (a 4x4 block of tiles needs only 25
+    # unique elevation PNGs, not 16*4=64), so gather the unique set first
+    # and fetch each exactly once through one bounded pool. The naive
+    # alternative — fanning out build_tile_payload calls, each spawning its
+    # own 5-way fetch — created thread/connection stampedes that blew past
+    # the gunicorn worker timeout on Render's small CPU.
+    elev_needed = set()
+    color_needed = set()
+    for (z, x, y) in specs:
+        if (z, x, y, grid) in _cache:
+            continue
+        elev_needed.update({(z, x, y), (z, x + 1, y), (z, x, y + 1), (z, x + 1, y + 1)})
+        color_needed.add((z, x, y))
+    if elev_needed or color_needed:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for (z, x, y) in elev_needed:
+                pool.submit(_get_elevation_array, z, x, y)
+            for (z, x, y) in color_needed:
+                pool.submit(_fetch_color_tile, z, x, y)
+            # pool context exit waits for all fetches; everything below
+            # hits the warm caches
+
     results = []
-    with ThreadPoolExecutor(max_workers=min(6, len(specs))) as pool:
-        futures = [pool.submit(build_tile_payload, z, x, y, grid) for (z, x, y) in specs]
-        for (z, x, y), future in zip(specs, futures):
-            try:
-                payload = future.result()
-            except Exception:
-                payload = None
-            if payload is None:
-                results.append({"z": z, "x": x, "y": y, "error": True})
-            else:
-                results.append(payload)
+    for (z, x, y) in specs:
+        try:
+            payload = build_tile_payload(z, x, y, grid)
+        except Exception:
+            payload = None
+        if payload is None:
+            results.append({"z": z, "x": x, "y": y, "error": True})
+        else:
+            results.append(payload)
     return jsonify({"grid": grid, "tiles": results})
 
 
