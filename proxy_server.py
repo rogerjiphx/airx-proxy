@@ -66,7 +66,7 @@ ENDPOINTS:
 
 from flask import Flask, jsonify, request
 from PIL import Image
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import requests
 import io
@@ -81,9 +81,41 @@ TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.
 # z/x/y — easy to get backwards, so it's spelled out explicitly here.
 COLOR_TILE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 COLOR_TILE_HEADERS = {"User-Agent": "airx-replica-hobby-project (personal/educational use)"}
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Multiple independent public Overpass mirrors, RACED IN PARALLEL (see
+# fetch_overpass_raced below) rather than tried one after another — a
+# dense-city query can legitimately take 10-25s on a healthy mirror, and
+# serial fallback (try #1, THEN #2, THEN #3, each paying its own timeout)
+# stacks those delays into 30-40+s, which lands right on Render's default
+# 30s gunicorn worker timeout and was the direct cause of intermittent 502s
+# even when a mirror would have succeeded if given the time. Racing bounds
+# total latency to whichever mirror finishes first instead of the sum.
+#
+# overpass.osm.ch was dropped from this list after being confirmed
+# (2026-07-09) to return HTTP 200 with an EMPTY elements array for a bbox
+# known to contain thousands of buildings — a stale/broken replica, not an
+# outage. That's worse than an honest failure: a wrong-but-"successful"
+# empty response would get cached indefinitely by _features_cache below,
+# permanently hiding real buildings/roads for that area.
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
 OVERPASS_HEADERS = {"User-Agent": "airx-replica-hobby-project (personal/educational use)"}
 MAJOR_HIGHWAYS = "motorway|trunk|primary|secondary|tertiary|residential|unclassified"
+
+# Per-category caps on the Overpass query itself (via "out geom N;"), not
+# just on what Roblox ends up keeping. Confirmed directly (2026-07-09):
+# dense downtown Phoenix, uncapped, returned 4.9MB and took 13-28s from a
+# single mirror; the SAME bbox with these caps returned 1.6MB in 3.6s.
+# Roblox already re-sorts by distance and hard-caps what it keeps
+# (Config.MAX_BUILDINGS_LOADED/MAX_ROADS_LOADED), so fetching, JSON-
+# encoding, and transferring thousands of far-away elements just to
+# discard most of them client-side was pure waste — these caps are set
+# comfortably above Roblox's own caps so its nearest-N selection still has
+# plenty of real candidates.
+BUILDING_OUT_CAP = 800
+ROAD_OUT_CAP = 400
+TAXIWAY_OUT_CAP = 300
 
 # simple in-memory caches so repeated requests are instant (and, for
 # /features, so we don't hammer Overpass's rate-limited free tier)
@@ -169,6 +201,49 @@ def estimate_building_height(tags):
     return 9.0
 
 
+def _fetch_overpass_one(mirror_url, query):
+    resp = requests.post(mirror_url, data={"data": query}, timeout=25, headers=OVERPASS_HEADERS)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_overpass_raced(query):
+    """Fire the query at every mirror in OVERPASS_URLS CONCURRENTLY and
+    return (data, None) from whichever succeeds first (parses as JSON with
+    a 200 status). Bounds worst-case latency to the fastest SUCCESSFUL
+    mirror instead of the sum of every mirror's timeout (see OVERPASS_URLS
+    comment for why the old serial try-then-fallback approach was causing
+    502s). If the fastest-to-complete mirror fails, the next-fastest
+    completion is checked instead — still concurrent, not a new serial
+    wait — so a mirror that fails fast doesn't block on one that's slow but
+    working. Returns (None, last_exception) if every mirror fails.
+
+    Deliberately NOT a `with ThreadPoolExecutor(...) as pool:` block —
+    that form calls shutdown(wait=True) on exit, which blocks until EVERY
+    submitted future finishes, including the slower mirror(s) we're trying
+    to avoid waiting on. That would silently defeat the entire point of
+    racing (identical worst-case latency to the old serial version). We
+    shut down with wait=False instead: the slower thread(s) keep running
+    to completion in the background and are simply never read."""
+    pool = ThreadPoolExecutor(max_workers=len(OVERPASS_URLS))
+    futures = {pool.submit(_fetch_overpass_one, url, query): url for url in OVERPASS_URLS}
+    last_error = None
+    result = None
+    try:
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                break
+            except (requests.RequestException, ValueError) as ex:
+                last_error = ex
+                continue
+    finally:
+        pool.shutdown(wait=False)
+    if result is not None:
+        return result, None
+    return None, last_error
+
+
 @app.route("/features")
 def features():
     try:
@@ -184,31 +259,24 @@ def features():
         return jsonify(_features_cache[key])
 
     s, w, n, e = key
-    # Overpass's public instance is prone to being slow/rate-limited under
-    # repeated testing. Our gunicorn deploy runs as a single worker (see
-    # BEGINNER_GUIDE.md's Start Command), so a slow Overpass call blocks
-    # THIS ENTIRE PROXY — including unrelated /elevation requests — until
-    # it resolves. Timeouts here are kept short specifically to bound that
-    # worst case; the real fix is running gunicorn with multiple workers
-    # (see README/proxy deploy notes), this is just a safety margin on
-    # top of that.
+    # Each way-type gets its OWN "out geom N;" so the cap applies per
+    # category (buildings can't crowd taxiways out of the budget) — see
+    # BUILDING_OUT_CAP/ROAD_OUT_CAP/TAXIWAY_OUT_CAP above for why these
+    # exist. All three "out" blocks land in one combined response's
+    # "elements" array.
     query = (
-        "[out:json][timeout:15];\n"
-        "(\n"
-        f'  way["building"]({s},{w},{n},{e});\n'
-        f'  way["highway"~"^({MAJOR_HIGHWAYS})$"]({s},{w},{n},{e});\n'
-        f'  way["aeroway"~"^(taxiway|apron)$"]({s},{w},{n},{e});\n'
-        ");\n"
-        "out geom;\n"
+        "[out:json][timeout:20];\n"
+        f'way["building"]({s},{w},{n},{e});\n'
+        f"out geom {BUILDING_OUT_CAP};\n"
+        f'way["highway"~"^({MAJOR_HIGHWAYS})$"]({s},{w},{n},{e});\n'
+        f"out geom {ROAD_OUT_CAP};\n"
+        f'way["aeroway"~"^(taxiway|apron)$"]({s},{w},{n},{e});\n'
+        f"out geom {TAXIWAY_OUT_CAP};\n"
     )
 
-    try:
-        resp = requests.post(
-            OVERPASS_URL, data={"data": query}, timeout=18, headers=OVERPASS_HEADERS)
-        resp.raise_for_status()
-        data = resp.json()
-    except (requests.RequestException, ValueError) as ex:
-        return jsonify({"error": f"overpass fetch failed: {ex}"}), 502
+    data, err = fetch_overpass_raced(query)
+    if data is None:
+        return jsonify({"error": f"all overpass mirrors failed: {err}"}), 502
 
     buildings, roads, taxiways = [], [], []
     for el in data.get("elements", []):
