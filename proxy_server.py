@@ -201,13 +201,26 @@ def estimate_building_height(tags):
     return 9.0
 
 
+OVERPASS_TIMEOUT_SECONDS = 15
+
+
 def _fetch_overpass_one(mirror_url, query):
-    resp = requests.post(mirror_url, data={"data": query}, timeout=25, headers=OVERPASS_HEADERS)
+    resp = requests.post(mirror_url, data={"data": query}, timeout=OVERPASS_TIMEOUT_SECONDS, headers=OVERPASS_HEADERS)
     resp.raise_for_status()
     return resp.json()
 
 
-HEDGE_DELAY_SECONDS = 7
+# HEDGE_DELAY_SECONDS + OVERPASS_TIMEOUT_SECONDS is the worst-case total
+# latency (primary fails right at the hedge boundary, backup then gets its
+# own full timeout budget) — this MUST stay safely under Render's gunicorn
+# worker timeout (30s default). An earlier version used 7 + 25 = 32s,
+# which exceeded it: gunicorn killed the worker mid-request, and the
+# client saw a clean HTTP 500 (confirmed live, 2026-07-09) instead of
+# either a fast success or an honest "all mirrors failed" 502. Verified
+# ONLY against Flask's own dev server locally before that shipped, which
+# has no such timeout — this class of bug only shows up under gunicorn.
+# 5 + 15 = 20s worst case, leaving real margin below the 30s ceiling.
+HEDGE_DELAY_SECONDS = 5
 
 
 def fetch_overpass_hedged(query):
