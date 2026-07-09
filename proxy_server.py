@@ -102,6 +102,13 @@ OVERPASS_URLS = [
 ]
 OVERPASS_HEADERS = {"User-Agent": "airx-replica-hobby-project (personal/educational use)"}
 MAJOR_HIGHWAYS = "motorway|trunk|primary|secondary|tertiary|residential|unclassified"
+# The "majorroads" feature type: arterial classes only, no residential/
+# unclassified. Exists so the Roblox client can query ROADS across a much
+# larger radius than buildings (the AirX look: road network visible across
+# the whole terrain, buildings only near the player) without the query
+# exploding — a 12km metro bbox of ALL road classes is thousands of ways,
+# but arterials alone stay bounded.
+MAJOR_ONLY_HIGHWAYS = "motorway|trunk|primary|secondary|tertiary"
 
 # Per-category caps on the Overpass query itself (via "out geom N;"), not
 # just on what Roblox ends up keeping. Confirmed directly (2026-07-09):
@@ -115,6 +122,7 @@ MAJOR_HIGHWAYS = "motorway|trunk|primary|secondary|tertiary|residential|unclassi
 # plenty of real candidates.
 BUILDING_OUT_CAP = 800
 ROAD_OUT_CAP = 400
+MAJORROAD_OUT_CAP = 600  # majorroads queries cover much larger bboxes
 TAXIWAY_OUT_CAP = 300
 
 # simple in-memory caches so repeated requests are instant (and, for
@@ -287,7 +295,7 @@ def fetch_overpass_hedged(query):
         pool.shutdown(wait=False)
 
 
-ALL_FEATURE_TYPES = frozenset({"buildings", "roads", "taxiways"})
+ALL_FEATURE_TYPES = frozenset({"buildings", "roads", "majorroads", "taxiways"})
 
 
 @app.route("/features")
@@ -334,6 +342,11 @@ def features():
     if "roads" in want:
         query_parts.append(f'way["highway"~"^({MAJOR_HIGHWAYS})$"]({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {ROAD_OUT_CAP};\n")
+    elif "majorroads" in want:
+        # arterials only, for wide-radius queries (elif: if a caller asked
+        # for both, "roads" already includes every majorroads class)
+        query_parts.append(f'way["highway"~"^({MAJOR_ONLY_HIGHWAYS})$"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {MAJORROAD_OUT_CAP};\n")
     if "taxiways" in want:
         query_parts.append(f'way["aeroway"~"^(taxiway|apron)$"]({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {TAXIWAY_OUT_CAP};\n")
