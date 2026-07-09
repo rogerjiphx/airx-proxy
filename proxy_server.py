@@ -66,6 +66,7 @@ ENDPOINTS:
 
 from flask import Flask, jsonify, request
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
 import io
@@ -238,6 +239,18 @@ def features():
     return jsonify(payload)
 
 
+def _fetch_elevation_tile(z, x, y):
+    return requests.get(TILE_URL.format(z=z, x=x, y=y), timeout=15)
+
+
+def _fetch_color_tile(z, x, y):
+    try:
+        return requests.get(
+            COLOR_TILE_URL.format(z=z, x=x, y=y), timeout=10, headers=COLOR_TILE_HEADERS)
+    except requests.RequestException:
+        return None
+
+
 @app.route("/elevation/<int:z>/<int:x>/<int:y>")
 def elevation(z, x, y):
     grid = min(max(int(request.args.get("grid", 33)), 2), 65)
@@ -246,7 +259,18 @@ def elevation(z, x, y):
     if key in _cache:
         return jsonify(_cache[key])
 
-    resp = requests.get(TILE_URL.format(z=z, x=x, y=y), timeout=15)
+    # Elevation and color come from two unrelated services (AWS, Esri) —
+    # fetch them CONCURRENTLY rather than one-after-the-other, so a tile
+    # only waits as long as the slower of the two, not the sum of both.
+    # This matters a lot on a free host: both are external, variable-
+    # latency network calls, and every never-before-seen tile pays for
+    # both in full.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        elevation_future = pool.submit(_fetch_elevation_tile, z, x, y)
+        color_future = pool.submit(_fetch_color_tile, z, x, y)
+        resp = elevation_future.result()
+        color_resp = color_future.result()
+
     if resp.status_code != 200:
         return jsonify({"error": f"tile fetch failed: {resp.status_code}"}), 502
 
@@ -257,14 +281,9 @@ def elevation(z, x, y):
     small = heights[np.ix_(idx, idx)]
 
     colors = None
-    try:
-        color_resp = requests.get(
-            COLOR_TILE_URL.format(z=z, x=x, y=y), timeout=10, headers=COLOR_TILE_HEADERS)
-        if color_resp.status_code == 200:
-            raw = sample_map_tile_raw(color_resp.content, grid)
-            colors = [[boosted_hex(px) for px in row] for row in raw]
-    except requests.RequestException:
-        colors = None  # ground still renders fine (elevation-based fallback color) without real colors
+    if color_resp is not None and color_resp.status_code == 200:
+        raw = sample_map_tile_raw(color_resp.content, grid)
+        colors = [[boosted_hex(px) for px in row] for row in raw]
 
     payload = {
         "z": z, "x": x, "y": y, "grid": grid,
