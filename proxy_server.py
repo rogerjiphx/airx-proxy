@@ -66,7 +66,7 @@ ENDPOINTS:
 
 from flask import Flask, jsonify, request
 from PIL import Image
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import numpy as np
 import requests
 import io
@@ -207,41 +207,74 @@ def _fetch_overpass_one(mirror_url, query):
     return resp.json()
 
 
-def fetch_overpass_raced(query):
-    """Fire the query at every mirror in OVERPASS_URLS CONCURRENTLY and
-    return (data, None) from whichever succeeds first (parses as JSON with
-    a 200 status). Bounds worst-case latency to the fastest SUCCESSFUL
-    mirror instead of the sum of every mirror's timeout (see OVERPASS_URLS
-    comment for why the old serial try-then-fallback approach was causing
-    502s). If the fastest-to-complete mirror fails, the next-fastest
-    completion is checked instead — still concurrent, not a new serial
-    wait — so a mirror that fails fast doesn't block on one that's slow but
-    working. Returns (None, last_exception) if every mirror fails.
+HEDGE_DELAY_SECONDS = 7
 
-    Deliberately NOT a `with ThreadPoolExecutor(...) as pool:` block —
-    that form calls shutdown(wait=True) on exit, which blocks until EVERY
-    submitted future finishes, including the slower mirror(s) we're trying
-    to avoid waiting on. That would silently defeat the entire point of
-    racing (identical worst-case latency to the old serial version). We
-    shut down with wait=False instead: the slower thread(s) keep running
-    to completion in the background and are simply never read."""
+
+def fetch_overpass_hedged(query):
+    """Try the primary mirror ALONE first. Only fall back to the backup
+    mirror if the primary hasn't finished within HEDGE_DELAY_SECONDS, or if
+    it fails outright. Returns (data, None) on success, (None,
+    last_exception) if nothing worked.
+
+    This replaced an earlier version that always fired BOTH mirrors in
+    parallel on every single request. That fixed the original problem
+    (stacked serial timeouts causing 502s) but had a real downside: it
+    doubled real load on both mirrors for every query, including the
+    common case where the primary was healthy and would have succeeded
+    fine alone. Repeated 502s kept happening even after that fix — the
+    likely explanation is Overpass's OWN rate-limiting reacting to the
+    sustained doubled request volume from always-parallel racing (public
+    Overpass mirrors run ~2 concurrent-slot limits; hammering both on every
+    query eats into that fast). Hedging keeps the "don't wait out a dead
+    mirror's full timeout" benefit while touching the backup only when the
+    primary actually needs help.
+
+    Deliberately not a `with ThreadPoolExecutor(...) as pool:` block —
+    that form's shutdown(wait=True) on exit blocks until EVERY submitted
+    future finishes, including ones we've already decided to stop waiting
+    on. shutdown(wait=False) lets an abandoned thread finish in the
+    background and simply never be read."""
     pool = ThreadPoolExecutor(max_workers=len(OVERPASS_URLS))
-    futures = {pool.submit(_fetch_overpass_one, url, query): url for url in OVERPASS_URLS}
     last_error = None
-    result = None
     try:
-        for future in as_completed(futures):
+        primary = pool.submit(_fetch_overpass_one, OVERPASS_URLS[0], query)
+        done, _pending = wait([primary], timeout=HEDGE_DELAY_SECONDS)
+
+        if primary in done:
             try:
-                result = future.result()
-                break
+                return primary.result(), None
+            except (requests.RequestException, ValueError) as ex:
+                last_error = ex
+            # primary already finished (with a failure) — try the backup
+            # alone, sequentially, no need to race against a resolved future
+            if len(OVERPASS_URLS) < 2:
+                return None, last_error
+            try:
+                return _fetch_overpass_one(OVERPASS_URLS[1], query), None
+            except (requests.RequestException, ValueError) as ex:
+                return None, ex
+
+        # primary is still running after the hedge delay — give it a
+        # backup to race against instead of waiting out its full timeout
+        if len(OVERPASS_URLS) < 2:
+            try:
+                return primary.result(), None
+            except (requests.RequestException, ValueError) as ex:
+                return None, ex
+
+        backup = pool.submit(_fetch_overpass_one, OVERPASS_URLS[1], query)
+        for future in as_completed([primary, backup]):
+            try:
+                return future.result(), None
             except (requests.RequestException, ValueError) as ex:
                 last_error = ex
                 continue
+        return None, last_error
     finally:
         pool.shutdown(wait=False)
-    if result is not None:
-        return result, None
-    return None, last_error
+
+
+ALL_FEATURE_TYPES = frozenset({"buildings", "roads", "taxiways"})
 
 
 @app.route("/features")
@@ -254,27 +287,46 @@ def features():
     except (KeyError, ValueError):
         return jsonify({"error": "south/west/north/east query params required"}), 400
 
-    key = snap_bbox(south, west, north, east)
-    if key in _features_cache:
-        return jsonify(_features_cache[key])
+    # Optional "?types=taxiways" (comma-separated) so a caller that only
+    # needs ONE category doesn't force Overpass to also scan+return the
+    # others. TaxiwayBuilder.lua's airport-radius query used to fetch
+    # buildings+roads it never even reads (see its own code — only
+    # response.taxiways is ever used) purely because this endpoint always
+    # queried all three; that was wasted Overpass load on every single
+    # airport visit for zero benefit. Defaults to all three (unchanged
+    # behavior for CityFeatures.lua, which genuinely wants all of them).
+    requested = request.args.get("types")
+    if requested:
+        want = {t.strip() for t in requested.split(",") if t.strip()} & ALL_FEATURE_TYPES
+        if not want:
+            want = ALL_FEATURE_TYPES
+    else:
+        want = ALL_FEATURE_TYPES
 
-    s, w, n, e = key
-    # Each way-type gets its OWN "out geom N;" so the cap applies per
-    # category (buildings can't crowd taxiways out of the budget) — see
-    # BUILDING_OUT_CAP/ROAD_OUT_CAP/TAXIWAY_OUT_CAP above for why these
-    # exist. All three "out" blocks land in one combined response's
+    bbox_key = snap_bbox(south, west, north, east)
+    cache_key = bbox_key + (tuple(sorted(want)),)
+    if cache_key in _features_cache:
+        return jsonify(_features_cache[cache_key])
+
+    s, w, n, e = bbox_key
+    # Each requested way-type gets its OWN "out geom N;" so the cap applies
+    # per category (buildings can't crowd taxiways out of the budget) —
+    # see BUILDING_OUT_CAP/ROAD_OUT_CAP/TAXIWAY_OUT_CAP above for why these
+    # exist. All requested "out" blocks land in one combined response's
     # "elements" array.
-    query = (
-        "[out:json][timeout:20];\n"
-        f'way["building"]({s},{w},{n},{e});\n'
-        f"out geom {BUILDING_OUT_CAP};\n"
-        f'way["highway"~"^({MAJOR_HIGHWAYS})$"]({s},{w},{n},{e});\n'
-        f"out geom {ROAD_OUT_CAP};\n"
-        f'way["aeroway"~"^(taxiway|apron)$"]({s},{w},{n},{e});\n'
-        f"out geom {TAXIWAY_OUT_CAP};\n"
-    )
+    query_parts = ["[out:json][timeout:20];\n"]
+    if "buildings" in want:
+        query_parts.append(f'way["building"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {BUILDING_OUT_CAP};\n")
+    if "roads" in want:
+        query_parts.append(f'way["highway"~"^({MAJOR_HIGHWAYS})$"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {ROAD_OUT_CAP};\n")
+    if "taxiways" in want:
+        query_parts.append(f'way["aeroway"~"^(taxiway|apron)$"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {TAXIWAY_OUT_CAP};\n")
+    query = "".join(query_parts)
 
-    data, err = fetch_overpass_raced(query)
+    data, err = fetch_overpass_hedged(query)
     if data is None:
         return jsonify({"error": f"all overpass mirrors failed: {err}"}), 502
 
@@ -303,7 +355,7 @@ def features():
 
     if len(_features_cache) > FEATURES_CACHE_MAX:
         _features_cache.clear()
-    _features_cache[key] = payload
+    _features_cache[cache_key] = payload
     return jsonify(payload)
 
 
