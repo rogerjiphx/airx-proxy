@@ -385,10 +385,6 @@ def features():
     return jsonify(payload)
 
 
-def _fetch_elevation_tile(z, x, y):
-    return requests.get(TILE_URL.format(z=z, x=x, y=y), timeout=15)
-
-
 def _fetch_color_tile(z, x, y):
     try:
         return requests.get(
@@ -397,34 +393,96 @@ def _fetch_color_tile(z, x, y):
         return None
 
 
-@app.route("/elevation/<int:z>/<int:x>/<int:y>")
-def elevation(z, x, y):
-    grid = min(max(int(request.args.get("grid", 33)), 2), 65)
+# Decoded 256x256 elevation arrays (float32 meters), keyed (z,x,y). Exists
+# because SEAM STITCHING (below) needs each tile's east/south neighbors:
+# without this cache every tile request would fetch 4 PNGs; with it, a
+# ring of adjacent tiles reuses each decoded PNG ~4 times, so total AWS
+# fetches stay roughly what they were before stitching. Kept deliberately
+# small: float32 256x256 = 256KB each, and every gunicorn worker process
+# holds its own copy of this cache — 120 x 256KB x 3 workers ~= 90MB,
+# which fits Render's free 512MB alongside the workers themselves.
+_elev_cache = {}
+ELEV_CACHE_MAX = 120
 
-    key = (z, x, y, grid)
-    if key in _cache:
-        return jsonify(_cache[key])
 
-    # Elevation and color come from two unrelated services (AWS, Esri) —
-    # fetch them CONCURRENTLY rather than one-after-the-other, so a tile
-    # only waits as long as the slower of the two, not the sum of both.
-    # This matters a lot on a free host: both are external, variable-
-    # latency network calls, and every never-before-seen tile pays for
-    # both in full.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        elevation_future = pool.submit(_fetch_elevation_tile, z, x, y)
-        color_future = pool.submit(_fetch_color_tile, z, x, y)
-        resp = elevation_future.result()
-        color_resp = color_future.result()
-
+def _get_elevation_array(z, x, y):
+    """Decoded elevation for one tile, cached. Returns None on any failure
+    (caller degrades gracefully). x wraps around the antimeridian; y out of
+    range (past the poles) returns None."""
+    n = 2 ** z
+    if y < 0 or y >= n:
+        return None
+    x = x % n
+    key = (z, x, y)
+    if key in _elev_cache:
+        return _elev_cache[key]
+    try:
+        resp = requests.get(TILE_URL.format(z=z, x=x, y=y), timeout=15)
+    except requests.RequestException:
+        return None
     if resp.status_code != 200:
-        return jsonify({"error": f"tile fetch failed: {resp.status_code}"}), 502
+        return None
+    arr = decode_terrarium(resp.content).astype(np.float32)
+    if len(_elev_cache) > ELEV_CACHE_MAX:
+        _elev_cache.clear()
+    _elev_cache[key] = arr
+    return arr
 
-    heights = decode_terrarium(resp.content)  # 256x256
 
-    # downsample to grid x grid by striding (fast, good enough for terrain)
-    idx = np.linspace(0, 255, grid).astype(int)
-    small = heights[np.ix_(idx, idx)]
+def build_tile_payload(z, x, y, grid):
+    """Full JSON payload for one tile (heights + colors), cached. Returns
+    None if the tile's own elevation fetch failed.
+
+    SEAM STITCHING: a slippy tile's 256 pixel rows/cols cover [edge, next
+    edge) — pixel 255 is one pixel SHORT of the tile's east/south boundary;
+    the true boundary value is the NEIGHBOR tile's pixel 0. The old
+    downsample (linspace 0..255 on one tile) put each tile's edge vertices
+    at pixel 255 while the adjacent tile put its matching vertices at ITS
+    pixel 0 — different pixels, different heights, and on slopes that
+    one-pixel disagreement (~5-10m) opened visible vertical gaps along
+    every tile border (reported live: "gaps between chunks"). Building a
+    257x257 grid whose last row/col come from the neighbors makes shared
+    edge vertices sample the SAME pixel on both sides — mathematically
+    identical heights, seamless borders."""
+    cache_key = (z, x, y, grid)
+    if cache_key in _cache:
+        return _cache[cache_key]
+
+    # main tile + 3 stitch neighbors + color, all concurrently — on a free
+    # host these are the latency, not the CPU
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        main_f = pool.submit(_get_elevation_array, z, x, y)
+        east_f = pool.submit(_get_elevation_array, z, x + 1, y)
+        south_f = pool.submit(_get_elevation_array, z, x, y + 1)
+        diag_f = pool.submit(_get_elevation_array, z, x + 1, y + 1)
+        color_f = pool.submit(_fetch_color_tile, z, x, y)
+        main = main_f.result()
+        east = east_f.result()
+        south = south_f.result()
+        diag = diag_f.result()
+        color_resp = color_f.result()
+
+    if main is None:
+        return None
+
+    full = np.empty((257, 257), dtype=np.float64)
+    full[:256, :256] = main
+    # missing neighbors (ocean-edge 404s, transient failures) degrade to
+    # duplicating this tile's own edge — worst case is the OLD seam
+    # behavior on that one border, never a hard failure
+    full[:256, 256] = east[:, 0] if east is not None else main[:, 255]
+    full[256, :256] = south[0, :] if south is not None else main[255, :]
+    if diag is not None:
+        full[256, 256] = diag[0, 0]
+    elif east is not None:
+        full[256, 256] = east[255, 0]
+    else:
+        full[256, 256] = main[255, 255]
+
+    # grid samples spanning 0..256 INCLUSIVE — edge vertices land exactly
+    # on tile boundaries (this is what makes adjacent tiles agree)
+    idx = np.linspace(0, 256, grid).astype(int)
+    small = full[np.ix_(idx, idx)]
 
     colors = None
     if color_resp is not None and color_resp.status_code == 200:
@@ -439,8 +497,60 @@ def elevation(z, x, y):
 
     if len(_cache) > CACHE_MAX:
         _cache.clear()
-    _cache[key] = payload
+    _cache[cache_key] = payload
+    return payload
+
+
+@app.route("/elevation/<int:z>/<int:x>/<int:y>")
+def elevation(z, x, y):
+    grid = min(max(int(request.args.get("grid", 33)), 2), 65)
+    payload = build_tile_payload(z, x, y, grid)
+    if payload is None:
+        return jsonify({"error": "tile fetch failed"}), 502
     return jsonify(payload)
+
+
+# Hard cap on tiles per batch request — bounds worst-case latency and
+# response size for one HTTP call.
+MAX_BATCH_TILES = 24
+
+
+@app.route("/elevation_batch")
+def elevation_batch():
+    """Many tiles in ONE request: /elevation_batch?tiles=15/100/200,15/101/200&grid=9
+    Exists because the Roblox client used to make one HTTP round-trip per
+    tile — 100+ requests to fill its terrain ring on a cold spawn, each
+    paying full round-trip latency and queueing behind the others. One
+    batched request amortizes that across 16+ tiles, and the server fans
+    the per-tile work out across threads. Failed tiles come back as
+    {"z","x","y","error":true} entries rather than failing the whole batch."""
+    grid = min(max(int(request.args.get("grid", 9)), 2), 65)
+    specs = []
+    for item in request.args.get("tiles", "").split(","):
+        parts = item.strip().split("/")
+        if len(parts) != 3:
+            continue
+        try:
+            specs.append((int(parts[0]), int(parts[1]), int(parts[2])))
+        except ValueError:
+            continue
+    if not specs:
+        return jsonify({"error": "tiles=z/x/y,z/x/y,... required"}), 400
+    specs = specs[:MAX_BATCH_TILES]
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(6, len(specs))) as pool:
+        futures = [pool.submit(build_tile_payload, z, x, y, grid) for (z, x, y) in specs]
+        for (z, x, y), future in zip(specs, futures):
+            try:
+                payload = future.result()
+            except Exception:
+                payload = None
+            if payload is None:
+                results.append({"z": z, "x": x, "y": y, "error": True})
+            else:
+                results.append(payload)
+    return jsonify({"grid": grid, "tiles": results})
 
 
 @app.route("/health")
