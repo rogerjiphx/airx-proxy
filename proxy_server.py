@@ -183,8 +183,16 @@ def features():
         return jsonify(_features_cache[key])
 
     s, w, n, e = key
+    # Overpass's public instance is prone to being slow/rate-limited under
+    # repeated testing. Our gunicorn deploy runs as a single worker (see
+    # BEGINNER_GUIDE.md's Start Command), so a slow Overpass call blocks
+    # THIS ENTIRE PROXY — including unrelated /elevation requests — until
+    # it resolves. Timeouts here are kept short specifically to bound that
+    # worst case; the real fix is running gunicorn with multiple workers
+    # (see README/proxy deploy notes), this is just a safety margin on
+    # top of that.
     query = (
-        "[out:json][timeout:25];\n"
+        "[out:json][timeout:15];\n"
         "(\n"
         f'  way["building"]({s},{w},{n},{e});\n'
         f'  way["highway"~"^({MAJOR_HIGHWAYS})$"]({s},{w},{n},{e});\n'
@@ -195,7 +203,7 @@ def features():
 
     try:
         resp = requests.post(
-            OVERPASS_URL, data={"data": query}, timeout=30, headers=OVERPASS_HEADERS)
+            OVERPASS_URL, data={"data": query}, timeout=18, headers=OVERPASS_HEADERS)
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, ValueError) as ex:
