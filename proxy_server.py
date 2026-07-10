@@ -134,6 +134,8 @@ BUILDING_OUT_CAP = 800
 ROAD_OUT_CAP = 400
 MAJORROAD_OUT_CAP = 600  # majorroads queries cover much larger bboxes
 TAXIWAY_OUT_CAP = 300
+LAKE_OUT_CAP = 150   # natural=water polygons
+RIVER_OUT_CAP = 150  # waterway=river/canal centerlines
 
 # simple in-memory caches so repeated requests are instant (and, for
 # /features, so we don't hammer Overpass's rate-limited free tier)
@@ -170,14 +172,14 @@ def sample_map_tile_raw(png_bytes, grid):
 
 
 def boosted_hex(rgb01):
-    """Satellite imagery already has real, natural color variation (unlike
-    a cartographic map's flat style fills), so this is a much gentler
-    lift than before — just enough to counter mild haze/atmospheric
-    dulling in the source imagery, not trying to invent saturation that
-    isn't there."""
+    """Deliberately STYLIZED grading, not faithful satellite color: strong
+    saturation push + brightness lift turns muted photographic land tones
+    into vivid painterly greens/golds (matching AirX's look, per the
+    user's reference screenshots — an earlier gentle 1.25x kept things
+    realistic but drab; the stylized look was explicitly chosen)."""
     h, s, v = colorsys.rgb_to_hsv(*rgb01)
-    s = min(1.0, s * 1.25)
-    v = min(1.0, v * 1.05 + 0.02)
+    s = min(1.0, s * 1.75)
+    v = min(1.0, v * 1.12 + 0.06)
     r, g, b = colorsys.hsv_to_rgb(h, s, v)
     return "%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
 
@@ -305,7 +307,7 @@ def fetch_overpass_hedged(query):
         pool.shutdown(wait=False)
 
 
-ALL_FEATURE_TYPES = frozenset({"buildings", "roads", "majorroads", "taxiways"})
+ALL_FEATURE_TYPES = frozenset({"buildings", "roads", "majorroads", "taxiways", "water"})
 
 
 @app.route("/features")
@@ -360,13 +362,19 @@ def features():
     if "taxiways" in want:
         query_parts.append(f'way["aeroway"~"^(taxiway|apron)$"]({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {TAXIWAY_OUT_CAP};\n")
+    if "water" in want:
+        # lakes/ponds as polygons, rivers/canals as centerlines
+        query_parts.append(f'way["natural"="water"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {LAKE_OUT_CAP};\n")
+        query_parts.append(f'way["waterway"~"^(river|canal)$"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {RIVER_OUT_CAP};\n")
     query = "".join(query_parts)
 
     data, err = fetch_overpass_hedged(query)
     if data is None:
         return jsonify({"error": f"all overpass mirrors failed: {err}"}), 502
 
-    buildings, roads, taxiways = [], [], []
+    buildings, roads, taxiways, lakes, rivers = [], [], [], [], []
     for el in data.get("elements", []):
         if el.get("type") != "way" or "geometry" not in el:
             continue
@@ -379,6 +387,10 @@ def features():
             buildings.append({"points": points, "heightM": estimate_building_height(tags)})
         elif "aeroway" in tags:
             taxiways.append({"points": points, "kind": tags.get("aeroway", "taxiway")})
+        elif tags.get("natural") == "water":
+            lakes.append({"points": points})
+        elif "waterway" in tags:
+            rivers.append({"points": points, "kind": tags.get("waterway", "river")})
         elif "highway" in tags:
             roads.append({"points": points, "class": tags.get("highway", "residential")})
 
@@ -387,6 +399,8 @@ def features():
         "buildings": buildings,
         "roads": roads,
         "taxiways": taxiways,
+        "lakes": lakes,
+        "rivers": rivers,
     }
 
     if len(_features_cache) > FEATURES_CACHE_MAX:
