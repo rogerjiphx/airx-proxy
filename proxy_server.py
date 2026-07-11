@@ -137,6 +137,14 @@ MAJORROAD_OUT_CAP = 600  # majorroads queries cover much larger bboxes
 TAXIWAY_OUT_CAP = 300
 LAKE_OUT_CAP = 150   # natural=water polygons
 RIVER_OUT_CAP = 150  # waterway=river/canal centerlines
+# The "bigbuildings" landmark layer: buildings whose PERIMETER exceeds
+# this, queryable across a much larger bbox than the full building set.
+# Measured (2026-07-10, 8km Phoenix bbox): 45,767 buildings unfiltered —
+# unfetchable — vs the 600 cap of substantial ones in 3.4s with this
+# filter. One landmark query gives instant whole-view building coverage;
+# small houses come from the small near-bubble queries as local texture.
+BIGBUILDING_MIN_PERIMETER_M = 140
+BIGBUILDING_OUT_CAP = 600
 
 # In-memory caches so repeated requests are instant (and, for /features,
 # so we don't hammer Overpass's rate-limited free tier).
@@ -335,7 +343,7 @@ def fetch_overpass_hedged(query):
         pool.shutdown(wait=False)
 
 
-ALL_FEATURE_TYPES = frozenset({"buildings", "roads", "majorroads", "taxiways", "water", "airport"})
+ALL_FEATURE_TYPES = frozenset({"buildings", "bigbuildings", "roads", "majorroads", "taxiways", "water", "airport"})
 
 
 @app.route("/features")
@@ -379,6 +387,12 @@ def features():
     if "buildings" in want:
         query_parts.append(f'way["building"]({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {BUILDING_OUT_CAP};\n")
+    elif "bigbuildings" in want:
+        # landmark layer (see BIGBUILDING_MIN_PERIMETER_M); elif because a
+        # query already fetching ALL buildings includes the big ones
+        query_parts.append(
+            f'way["building"](if:length()>{BIGBUILDING_MIN_PERIMETER_M})({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {BIGBUILDING_OUT_CAP};\n")
     if "roads" in want:
         query_parts.append(f'way["highway"~"^({MAJOR_HIGHWAYS})$"]({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {ROAD_OUT_CAP};\n")
