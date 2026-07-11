@@ -64,7 +64,8 @@ ENDPOINTS:
     a paid imagery provider and a self-hosted Overpass instance instead.
 """
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
+import json
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from requests.adapters import HTTPAdapter
@@ -137,12 +138,21 @@ TAXIWAY_OUT_CAP = 300
 LAKE_OUT_CAP = 150   # natural=water polygons
 RIVER_OUT_CAP = 150  # waterway=river/canal centerlines
 
-# simple in-memory caches so repeated requests are instant (and, for
-# /features, so we don't hammer Overpass's rate-limited free tier)
-_cache = {}
-CACHE_MAX = 2000
-_features_cache = {}
-FEATURES_CACHE_MAX = 500
+# In-memory caches so repeated requests are instant (and, for /features,
+# so we don't hammer Overpass's rate-limited free tier).
+#
+# MEMORY DISCIPLINE — these two rules exist because the service OOM-crash-
+# looped in production (repeated "used over 512MB" kills, 2026-07-10):
+#   1. Cache values are compact JSON STRINGS, never Python object trees —
+#      a dense-city /features payload is ~300KB as JSON but MEGABYTES as
+#      nested Python lists (every float is a 24-byte object). Cached
+#      strings are also returned directly, skipping re-serialization.
+#   2. Caps are sized for 512MB SPLIT ACROSS WORKER PROCESSES, each of
+#      which holds its own copy of every cache. Run 2 workers, not 3.
+_cache = {}          # (z,x,y,grid) -> JSON string of one tile payload (~4KB each)
+CACHE_MAX = 800
+_features_cache = {} # snapped bbox+types -> JSON string (~50-500KB each)
+FEATURES_CACHE_MAX = 60
 FEATURES_GRID_DEG = 0.02  # ~2km; bboxes snap to this grid before querying/caching
 
 
@@ -307,7 +317,7 @@ def fetch_overpass_hedged(query):
         pool.shutdown(wait=False)
 
 
-ALL_FEATURE_TYPES = frozenset({"buildings", "roads", "majorroads", "taxiways", "water"})
+ALL_FEATURE_TYPES = frozenset({"buildings", "roads", "majorroads", "taxiways", "water", "airport"})
 
 
 @app.route("/features")
@@ -339,7 +349,7 @@ def features():
     bbox_key = snap_bbox(south, west, north, east)
     cache_key = bbox_key + (tuple(sorted(want)),)
     if cache_key in _features_cache:
-        return jsonify(_features_cache[cache_key])
+        return Response(_features_cache[cache_key], mimetype="application/json")
 
     s, w, n, e = bbox_key
     # Each requested way-type gets its OWN "out geom N;" so the cap applies
@@ -359,7 +369,13 @@ def features():
         # for both, "roads" already includes every majorroads class)
         query_parts.append(f'way["highway"~"^({MAJOR_ONLY_HIGHWAYS})$"]({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {MAJORROAD_OUT_CAP};\n")
-    if "taxiways" in want:
+    if "airport" in want:
+        # the full airport ground plan: taxiway centerlines PLUS apron
+        # polygons and the aerodrome perimeter polygon (the green infield
+        # base + gray tarmac areas of the AirX airport look)
+        query_parts.append(f'way["aeroway"~"^(taxiway|apron|aerodrome)$"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {TAXIWAY_OUT_CAP};\n")
+    elif "taxiways" in want:
         query_parts.append(f'way["aeroway"~"^(taxiway|apron)$"]({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {TAXIWAY_OUT_CAP};\n")
     if "water" in want:
@@ -375,6 +391,7 @@ def features():
         return jsonify({"error": f"all overpass mirrors failed: {err}"}), 502
 
     buildings, roads, taxiways, lakes, rivers = [], [], [], [], []
+    aprons, aerodromes = [], []
     for el in data.get("elements", []):
         if el.get("type") != "way" or "geometry" not in el:
             continue
@@ -386,7 +403,13 @@ def features():
         if "building" in tags:
             buildings.append({"points": points, "heightM": estimate_building_height(tags)})
         elif "aeroway" in tags:
-            taxiways.append({"points": points, "kind": tags.get("aeroway", "taxiway")})
+            kind = tags.get("aeroway", "taxiway")
+            if kind == "apron":
+                aprons.append({"points": points})
+            elif kind == "aerodrome":
+                aerodromes.append({"points": points})
+            else:
+                taxiways.append({"points": points, "kind": kind})
         elif tags.get("natural") == "water":
             lakes.append({"points": points})
         elif "waterway" in tags:
@@ -401,12 +424,15 @@ def features():
         "taxiways": taxiways,
         "lakes": lakes,
         "rivers": rivers,
+        "aprons": aprons,
+        "aerodromes": aerodromes,
     }
 
+    payload_json = json.dumps(payload, separators=(",", ":"))
     if len(_features_cache) > FEATURES_CACHE_MAX:
         _features_cache.clear()
-    _features_cache[cache_key] = payload
-    return jsonify(payload)
+    _features_cache[cache_key] = payload_json
+    return Response(payload_json, mimetype="application/json")
 
 
 # Raw satellite tile bytes, keyed (z,x,y) — ~15KB each, so this is cheap
@@ -442,10 +468,9 @@ def _fetch_color_tile(z, x, y):
 # ring of adjacent tiles reuses each decoded PNG ~4 times, so total AWS
 # fetches stay roughly what they were before stitching. Kept deliberately
 # small: float32 256x256 = 256KB each, and every gunicorn worker process
-# holds its own copy of this cache — 120 x 256KB x 3 workers ~= 90MB,
-# which fits Render's free 512MB alongside the workers themselves.
+# holds its own copy of this cache — 80 x 256KB x 2 workers ~= 40MB.
 _elev_cache = {}
-ELEV_CACHE_MAX = 120
+ELEV_CACHE_MAX = 80
 
 
 def _get_elevation_array(z, x, y):
@@ -473,8 +498,9 @@ def _get_elevation_array(z, x, y):
 
 
 def build_tile_payload(z, x, y, grid):
-    """Full JSON payload for one tile (heights + colors), cached. Returns
-    None if the tile's own elevation fetch failed.
+    """One tile's payload (heights + colors) as a compact JSON STRING,
+    cached as such (see cache memory notes above). Returns None if the
+    tile's own elevation fetch failed.
 
     SEAM STITCHING: a slippy tile's 256 pixel rows/cols cover [edge, next
     edge) — pixel 255 is one pixel SHORT of the tile's east/south boundary;
@@ -537,20 +563,21 @@ def build_tile_payload(z, x, y, grid):
         "heights": [[round(float(v), 1) for v in row] for row in small],
         "colors": colors,
     }
+    payload_json = json.dumps(payload, separators=(",", ":"))
 
     if len(_cache) > CACHE_MAX:
         _cache.clear()
-    _cache[cache_key] = payload
-    return payload
+    _cache[cache_key] = payload_json
+    return payload_json
 
 
 @app.route("/elevation/<int:z>/<int:x>/<int:y>")
 def elevation(z, x, y):
     grid = min(max(int(request.args.get("grid", 33)), 2), 65)
-    payload = build_tile_payload(z, x, y, grid)
-    if payload is None:
+    payload_json = build_tile_payload(z, x, y, grid)
+    if payload_json is None:
         return jsonify({"error": "tile fetch failed"}), 502
-    return jsonify(payload)
+    return Response(payload_json, mimetype="application/json")
 
 
 # Hard cap on tiles per batch request — bounds worst-case latency and
@@ -604,17 +631,21 @@ def elevation_batch():
             # pool context exit waits for all fetches; everything below
             # hits the warm caches
 
-    results = []
+    # assemble the response by SPLICING cached JSON strings — payloads are
+    # cached pre-serialized (see memory notes on _cache) and never exist
+    # as Python object trees here
+    fragments = []
     for (z, x, y) in specs:
         try:
-            payload = build_tile_payload(z, x, y, grid)
+            payload_json = build_tile_payload(z, x, y, grid)
         except Exception:
-            payload = None
-        if payload is None:
-            results.append({"z": z, "x": x, "y": y, "error": True})
+            payload_json = None
+        if payload_json is None:
+            fragments.append(json.dumps({"z": z, "x": x, "y": y, "error": True}, separators=(",", ":")))
         else:
-            results.append(payload)
-    return jsonify({"grid": grid, "tiles": results})
+            fragments.append(payload_json)
+    body = '{"grid":%d,"tiles":[%s]}' % (grid, ",".join(fragments))
+    return Response(body, mimetype="application/json")
 
 
 @app.route("/health")
