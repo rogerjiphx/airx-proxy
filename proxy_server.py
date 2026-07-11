@@ -181,6 +181,24 @@ def sample_map_tile_raw(png_bytes, grid):
     return raw
 
 
+def smooth_color_grid(raw):
+    """3x3 weighted smoothing over the sampled color grid (edge-clamped).
+    Raw satellite sampling gives each terrain cell an independent color,
+    which from altitude reads as salt-and-pepper pixel noise; AirX's
+    ground reads as smooth painterly patches instead. One gentle blur
+    kills the per-cell noise while keeping real land-cover features
+    (fields, parks, urban blocks) intact."""
+    g = np.array(raw, dtype=np.float64)  # grid x grid x 3
+    padded = np.pad(g, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    acc = np.zeros_like(g)
+    n = g.shape[0]
+    for dr, dc, wgt in ((0, 0, 4), (-1, 0, 2), (1, 0, 2), (0, -1, 2), (0, 1, 2),
+                        (-1, -1, 1), (-1, 1, 1), (1, -1, 1), (1, 1, 1)):
+        acc += wgt * padded[1 + dr:1 + dr + n, 1 + dc:1 + dc + n]
+    acc /= 16.0
+    return [[(float(px[0]), float(px[1]), float(px[2])) for px in row] for row in acc]
+
+
 def boosted_hex(rgb01):
     """Deliberately STYLIZED grading, not faithful satellite color: strong
     saturation push + brightness lift turns muted photographic land tones
@@ -555,7 +573,7 @@ def build_tile_payload(z, x, y, grid):
 
     colors = None
     if color_bytes is not None:
-        raw = sample_map_tile_raw(color_bytes, grid)
+        raw = smooth_color_grid(sample_map_tile_raw(color_bytes, grid))
         colors = [[boosted_hex(px) for px in row] for row in raw]
 
     payload = {
