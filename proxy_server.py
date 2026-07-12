@@ -145,6 +145,13 @@ RIVER_OUT_CAP = 150  # waterway=river/canal centerlines
 # small houses come from the small near-bubble queries as local texture.
 BIGBUILDING_MIN_PERIMETER_M = 140
 BIGBUILDING_OUT_CAP = 600
+# The "tallbuildings" skyline layer: buildings tagged 4+ stories,
+# queryable across VERY large bboxes (tag filters are index lookups —
+# measured 368 ways over a 24km Phoenix bbox in 3.8s — whereas the
+# perimeter filter above computes geometry for every candidate and
+# doesn't scale past ~8km bboxes). These are the structures that should
+# be visible from far away.
+TALLBUILDING_OUT_CAP = 400
 
 # In-memory caches so repeated requests are instant (and, for /features,
 # so we don't hammer Overpass's rate-limited free tier).
@@ -343,7 +350,7 @@ def fetch_overpass_hedged(query):
         pool.shutdown(wait=False)
 
 
-ALL_FEATURE_TYPES = frozenset({"buildings", "bigbuildings", "roads", "majorroads", "taxiways", "water", "airport"})
+ALL_FEATURE_TYPES = frozenset({"buildings", "bigbuildings", "tallbuildings", "roads", "majorroads", "taxiways", "water", "airport"})
 
 
 @app.route("/features")
@@ -393,6 +400,11 @@ def features():
         query_parts.append(
             f'way["building"](if:length()>{BIGBUILDING_MIN_PERIMETER_M})({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {BIGBUILDING_OUT_CAP};\n")
+    elif "tallbuildings" in want:
+        # skyline layer (see TALLBUILDING_OUT_CAP): 4+ story buildings only
+        query_parts.append(
+            f'way["building"]["building:levels"~"^0*([4-9]|[1-9][0-9]+)$"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {TALLBUILDING_OUT_CAP};\n")
     if "roads" in want:
         query_parts.append(f'way["highway"~"^({MAJOR_HIGHWAYS})$"]({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {ROAD_OUT_CAP};\n")
