@@ -49,7 +49,7 @@ ENDPOINTS:
     Real OpenStreetMap building footprints, road centerlines, and airport
     taxiway/apron paths within a bounding box, via the Overpass API.
     Bounding boxes are snapped to a coarse grid and cached indefinitely
-    in-memory, because Overpass's free public instance has strict rate
+    on disk (SQLite), because Overpass's free public instance has strict rate
     limits (~10k req/day, 2 concurrent slots) — nowhere near enough for
     1:1 per-player-movement queries. Callers should query a modest area
     at once (e.g. once per near-ring refresh, not per tile) rather than
@@ -66,6 +66,9 @@ ENDPOINTS:
 
 from flask import Flask, Response, jsonify, request
 import json
+import sqlite3
+import threading
+import os
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from requests.adapters import HTTPAdapter
@@ -153,21 +156,68 @@ BIGBUILDING_OUT_CAP = 600
 # be visible from far away.
 TALLBUILDING_OUT_CAP = 400
 
-# In-memory caches so repeated requests are instant (and, for /features,
-# so we don't hammer Overpass's rate-limited free tier).
-#
-# MEMORY DISCIPLINE — these two rules exist because the service OOM-crash-
-# looped in production (repeated "used over 512MB" kills, 2026-07-10):
-#   1. Cache values are compact JSON STRINGS, never Python object trees —
-#      a dense-city /features payload is ~300KB as JSON but MEGABYTES as
-#      nested Python lists (every float is a 24-byte object). Cached
-#      strings are also returned directly, skipping re-serialization.
-#   2. Caps are sized for 512MB SPLIT ACROSS WORKER PROCESSES, each of
-#      which holds its own copy of every cache. Run 2 workers, not 3.
-_cache = {}          # (z,x,y,grid) -> JSON string of one tile payload (~4KB each)
-CACHE_MAX = 800
-_features_cache = {} # snapped bbox+types -> JSON string (~50-500KB each)
-FEATURES_CACHE_MAX = 60
+# DISK-BACKED caches (SQLite) for the two payload caches that grow WITHOUT
+# BOUND as players explore more area — elevation tile payloads and
+# /features query results. WHY DISK, NOT RAM: confirmed live twice
+# (2026-07-10, 2026-07-11) — this service OOM-crash-looped in production
+# even after capping in-memory cache entry counts, because each round of
+# new features (landmark/skyline layers, wider query radii) raised the
+# average PAYLOAD SIZE per entry, so a fixed entry-count cap didn't bound
+# memory the way it was meant to. Moving these two caches to a local
+# SQLite file removes the RAM ceiling entirely — disk is orders of
+# magnitude cheaper than Render's paid-tier RAM quota, so caches can now
+# hold far more without ever risking OOM again, AND stay warm across
+# gunicorn worker restarts (an in-memory cache didn't). Kept as plain
+# TEXT/BLOB key-value storage, no ORM, so this stays a drop-in swap for
+# what were plain dicts. _elev_cache/_color_cache below (raw decoded
+# arrays used only transiently during neighbor-tile stitching) are NOT
+# moved: they're already small and naturally bounded by what's actively
+# being stitched, and keeping them in RAM avoids disk I/O on that hot path.
+_DB_PATH = os.environ.get("AIRX_CACHE_DB", "/tmp/airx_cache.sqlite3")
+_db_lock = threading.Lock()
+
+
+def _db_conn():
+    conn = sqlite3.connect(_DB_PATH, timeout=10, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _db_init():
+    with _db_lock, _db_conn() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS tile_cache (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID")
+        conn.execute("CREATE TABLE IF NOT EXISTS features_cache (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID")
+
+
+def _db_get(table, key):
+    with _db_lock, _db_conn() as conn:
+        row = conn.execute(f"SELECT value FROM {table} WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _db_set(table, key, value):
+    with _db_lock, _db_conn() as conn:
+        conn.execute(f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)", (key, value))
+
+
+_db_init()
+
+# Generous caps are fine now that storage is disk, not RAM — these exist
+# only to bound disk usage over very long uptimes, not to protect memory.
+TILE_CACHE_MAX = 20000
+FEATURES_CACHE_MAX = 5000
+
+
+def _db_count(table):
+    with _db_lock, _db_conn() as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def _db_clear(table):
+    with _db_lock, _db_conn() as conn:
+        conn.execute(f"DELETE FROM {table}")
+
+
 FEATURES_GRID_DEG = 0.02  # ~2km; bboxes snap to this grid before querying/caching
 
 
@@ -350,7 +400,23 @@ def fetch_overpass_hedged(query):
         pool.shutdown(wait=False)
 
 
-ALL_FEATURE_TYPES = frozenset({"buildings", "bigbuildings", "tallbuildings", "roads", "majorroads", "taxiways", "water", "airport"})
+ALL_FEATURE_TYPES = frozenset({"buildings", "bigbuildings", "tallbuildings", "roads", "majorroads", "taxiways", "water", "airport", "landuse"})
+
+# LANDUSE polygons: forests, farmland, parks, urban zones, beaches,
+# wetlands — rendered as flat colored ground patches (same triangulation
+# engine as lakes/buildings). This is what turns terrain from "satellite
+# photo, nicely graded" into "map illustration" — AirX's ground reads as
+# distinct SHAPES (a farm field, a park, a residential block), not a
+# color gradient. Measured (2026-07-11, 7km Phoenix bbox): 149 ways,
+# 258KB, 2.7s — three separate tag families in one query (landuse=,
+# natural=, leisure=) since a single way is never tagged with more than
+# one of them, so this can't double-count.
+LANDUSE_TAGS = "forest|farmland|farmyard|meadow|grass|orchard|vineyard|cemetery|recreation_ground|residential|industrial|commercial"
+NATURAL_LANDUSE_TAGS = "wood|scrub|grassland|heath|beach|sand|wetland"
+LEISURE_LANDUSE_TAGS = "park|garden|golf_course|pitch|stadium"
+LANDUSE_OUT_CAP = 700
+NATURAL_LANDUSE_OUT_CAP = 300
+LEISURE_LANDUSE_OUT_CAP = 300
 
 
 @app.route("/features")
@@ -380,9 +446,10 @@ def features():
         want = ALL_FEATURE_TYPES
 
     bbox_key = snap_bbox(south, west, north, east)
-    cache_key = bbox_key + (tuple(sorted(want)),)
-    if cache_key in _features_cache:
-        return Response(_features_cache[cache_key], mimetype="application/json")
+    cache_key = str(bbox_key + (tuple(sorted(want)),))
+    cached = _db_get("features_cache", cache_key)
+    if cached is not None:
+        return Response(cached, mimetype="application/json")
 
     s, w, n, e = bbox_key
     # Each requested way-type gets its OWN "out geom N;" so the cap applies
@@ -428,6 +495,16 @@ def features():
         query_parts.append(f"out geom {LAKE_OUT_CAP};\n")
         query_parts.append(f'way["waterway"~"^(river|canal)$"]({s},{w},{n},{e});\n')
         query_parts.append(f"out geom {RIVER_OUT_CAP};\n")
+    if "landuse" in want:
+        # three separate tag families (see LANDUSE_TAGS/NATURAL_LANDUSE_TAGS/
+        # LEISURE_LANDUSE_TAGS above) — a way is never tagged with more than
+        # one, so this can't double-count the same polygon
+        query_parts.append(f'way["landuse"~"^({LANDUSE_TAGS})$"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {LANDUSE_OUT_CAP};\n")
+        query_parts.append(f'way["natural"~"^({NATURAL_LANDUSE_TAGS})$"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {NATURAL_LANDUSE_OUT_CAP};\n")
+        query_parts.append(f'way["leisure"~"^({LEISURE_LANDUSE_TAGS})$"]({s},{w},{n},{e});\n')
+        query_parts.append(f"out geom {LEISURE_LANDUSE_OUT_CAP};\n")
     query = "".join(query_parts)
 
     data, err = fetch_overpass_hedged(query)
@@ -435,7 +512,7 @@ def features():
         return jsonify({"error": f"all overpass mirrors failed: {err}"}), 502
 
     buildings, roads, taxiways, lakes, rivers = [], [], [], [], []
-    aprons, aerodromes = [], []
+    aprons, aerodromes, landuse = [], [], []
     for el in data.get("elements", []):
         if el.get("type") != "way" or "geometry" not in el:
             continue
@@ -460,11 +537,18 @@ def features():
             rivers.append({"points": points, "kind": tags.get("waterway", "river")})
         elif "highway" in tags:
             roads.append({"points": points, "class": tags.get("highway", "residential")})
+        elif tags.get("landuse"):
+            landuse.append({"points": points, "kind": tags["landuse"]})
+        elif tags.get("natural"):
+            landuse.append({"points": points, "kind": tags["natural"]})
+        elif tags.get("leisure"):
+            landuse.append({"points": points, "kind": tags["leisure"]})
 
     payload = {
         "bounds": {"south": s, "west": w, "north": n, "east": e},
         "buildings": buildings,
         "roads": roads,
+        "landuse": landuse,
         "taxiways": taxiways,
         "lakes": lakes,
         "rivers": rivers,
@@ -473,9 +557,9 @@ def features():
     }
 
     payload_json = json.dumps(payload, separators=(",", ":"))
-    if len(_features_cache) > FEATURES_CACHE_MAX:
-        _features_cache.clear()
-    _features_cache[cache_key] = payload_json
+    if _db_count("features_cache") > FEATURES_CACHE_MAX:
+        _db_clear("features_cache")
+    _db_set("features_cache", cache_key, payload_json)
     return Response(payload_json, mimetype="application/json")
 
 
@@ -557,9 +641,10 @@ def build_tile_payload(z, x, y, grid):
     257x257 grid whose last row/col come from the neighbors makes shared
     edge vertices sample the SAME pixel on both sides — mathematically
     identical heights, seamless borders."""
-    cache_key = (z, x, y, grid)
-    if cache_key in _cache:
-        return _cache[cache_key]
+    cache_key = str((z, x, y, grid))
+    cached = _db_get("tile_cache", cache_key)
+    if cached is not None:
+        return cached
 
     # main tile + 3 stitch neighbors + color, all concurrently — on a free
     # host these are the latency, not the CPU
@@ -609,9 +694,9 @@ def build_tile_payload(z, x, y, grid):
     }
     payload_json = json.dumps(payload, separators=(",", ":"))
 
-    if len(_cache) > CACHE_MAX:
-        _cache.clear()
-    _cache[cache_key] = payload_json
+    if _db_count("tile_cache") > TILE_CACHE_MAX:
+        _db_clear("tile_cache")
+    _db_set("tile_cache", cache_key, payload_json)
     return payload_json
 
 
@@ -662,7 +747,7 @@ def elevation_batch():
     elev_needed = set()
     color_needed = set()
     for (z, x, y) in specs:
-        if (z, x, y, grid) in _cache:
+        if _db_get("tile_cache", str((z, x, y, grid))) is not None:
             continue
         elev_needed.update({(z, x, y), (z, x + 1, y), (z, x, y + 1), (z, x + 1, y + 1)})
         color_needed.add((z, x, y))
@@ -676,8 +761,8 @@ def elevation_batch():
             # hits the warm caches
 
     # assemble the response by SPLICING cached JSON strings — payloads are
-    # cached pre-serialized (see memory notes on _cache) and never exist
-    # as Python object trees here
+    # cached pre-serialized in tile_cache (see the disk-cache notes above)
+    # and never exist as Python object trees here
     fragments = []
     for (z, x, y) in specs:
         try:
